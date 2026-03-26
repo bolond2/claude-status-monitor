@@ -1,0 +1,88 @@
+# .github/workflows/claude-status-monitor.yml
+#
+# Runs the Claude status check every 5 minutes using GitHub Actions.
+# FREE — no server required. Works as long as you have a GitHub repo.
+#
+# Setup:
+#   1. Add SLACK_WEBHOOK_URL to your repo's GitHub Secrets:
+#      Repo → Settings → Secrets → Actions → New repository secret
+#   2. Commit this file to .github/workflows/
+#   3. Done — GitHub will run it on schedule automatically.
+
+name: Claude Status Monitor
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # every 5 minutes
+  workflow_dispatch:         # allow manual trigger from GitHub UI
+
+jobs:
+  check-claude-status:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    steps:
+      - name: Check Claude Status & Alert Slack
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          python3 - <<'EOF'
+          import requests, json, os, sys
+          from datetime import datetime, timezone
+
+          WEBHOOK = os.environ["SLACK_WEBHOOK_URL"]
+          STATUS_URL = "https://status.claude.com/api/v2/summary.json"
+
+          IMPACT_COLOR = {
+              "none": "#36a64f", "minor": "#f0c418",
+              "major": "#e07b39", "critical": "#cc0000",
+          }
+
+          def now():
+              return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+          def post_slack(text, color="#f0c418", fields=None):
+              payload = {
+                  "text": text,
+                  "attachments": [{"color": color, "fields": fields or []}]
+              }
+              r = requests.post(WEBHOOK, json=payload, timeout=10)
+              r.raise_for_status()
+
+          r = requests.get(STATUS_URL, timeout=15)
+          r.raise_for_status()
+          data = r.json()
+
+          indicator   = data["status"]["indicator"]
+          description = data["status"]["description"]
+          incidents   = data.get("incidents", [])
+
+          if indicator == "none" and not incidents:
+              print(f"✅ All systems operational at {now()}")
+              sys.exit(0)
+
+          # Build Slack message
+          incident_lines = []
+          for inc in incidents:
+              impact  = inc.get("impact", "?")
+              name    = inc.get("name", "Unknown")
+              status  = inc.get("status", "")
+              updates = inc.get("incident_updates", [])
+              latest  = updates[0]["body"] if updates else "No details."
+              link    = inc.get("shortlink", "https://status.claude.com")
+              incident_lines.append(f"• *{name}* [{impact.upper()}] — {status}\n  {latest}\n  <{link}|View →>")
+
+          body = "\n\n".join(incident_lines) if incident_lines else description
+
+          post_slack(
+              text=f"🚨 *Claude Status Alert* — `{description}`",
+              color=IMPACT_COLOR.get(indicator, "#f0c418"),
+              fields=[
+                  {"title": "Overall",    "value": description,   "short": True},
+                  {"title": "Detected",   "value": now(),         "short": True},
+                  {"title": "Incidents",  "value": body,          "short": False},
+                  {"title": "Status Page","value": "<https://status.claude.com|status.claude.com>", "short": True},
+              ]
+          )
+          print(f"Alert sent: {indicator} — {description}")
+          EOF
