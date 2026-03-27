@@ -47,7 +47,7 @@ jobs:
           CACHE_FILE  = "alerted_ids.txt"
 
           # ── Only alert on these levels ────────────────────────────────────
-          ALERT_ON_IMPACT = {"major", "critical"}
+          ALERT_ON_IMPACT = {"minor", "major", "critical"}
 
           IMPACT_COLOR = {
               "minor":    "#f0c418",
