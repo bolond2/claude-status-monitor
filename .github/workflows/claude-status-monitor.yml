@@ -24,7 +24,7 @@ jobs:
       # We use the GitHub Actions cache to remember which incidents
       # we've already alerted on — so you don't get repeat messages.
       - name: Restore alert history cache
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: alerted_ids.txt
           key: claude-alerted-ids-${{ github.run_id }}
@@ -133,6 +133,8 @@ jobs:
 
               payload = {
                   "text": f"{emoji} *Claude Incident [{alert['impact'].upper()}]: {alert['name']}*",
+                  "username": "Claude Status Monitor",
+                  "icon_url": "https://www.anthropic.com/images/icons/apple-touch-icon.png",
                   "attachments": [{
                       "color": color,
                       "fields": [
@@ -164,7 +166,7 @@ jobs:
 
       - name: Save alert history cache
         if: always()
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: alerted_ids.txt
           key: claude-alerted-ids-${{ github.run_id }}
