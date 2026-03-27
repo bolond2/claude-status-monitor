@@ -1,13 +1,12 @@
 # .github/workflows/claude-status-monitor.yml
 #
-# Runs the Claude status check every 5 minutes using GitHub Actions.
-# FREE — no server required. Works as long as you have a GitHub repo.
+# Alerts Slack only for MAJOR or CRITICAL Claude incidents.
+# Uses Anthropic's real timestamps. Won't re-alert on the same update.
 #
 # Setup:
-#   1. Add SLACK_WEBHOOK_URL to your repo's GitHub Secrets:
-#      Repo → Settings → Secrets → Actions → New repository secret
+#   1. Add SLACK_WEBHOOK_URL to repo Secrets (Settings → Secrets → Actions)
 #   2. Commit this file to .github/workflows/
-#   3. Done — GitHub will run it on schedule automatically.
+#   3. Done.
 
 name: Claude Status Monitor
 
@@ -22,67 +21,150 @@ jobs:
     timeout-minutes: 2
 
     steps:
+      # We use the GitHub Actions cache to remember which incidents
+      # we've already alerted on — so you don't get repeat messages.
+      - name: Restore alert history cache
+        uses: actions/cache@v3
+        with:
+          path: alerted_ids.txt
+          key: claude-alerted-ids-${{ github.run_id }}
+          restore-keys: |
+            claude-alerted-ids-
+
       - name: Check Claude Status & Alert Slack
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           python3 - <<'EOF'
-          import requests, json, os, sys
+          import requests, os, sys
           from datetime import datetime, timezone
 
-          WEBHOOK = os.environ["SLACK_WEBHOOK_URL"]
-          STATUS_URL = "https://status.claude.com/api/v2/summary.json"
+          WEBHOOK     = os.environ["SLACK_WEBHOOK_URL"]
+          STATUS_URL  = "https://status.claude.com/api/v2/summary.json"
+          CACHE_FILE  = "alerted_ids.txt"
+
+          # ── Only alert on these levels ────────────────────────────────────
+          ALERT_ON_IMPACT = {"major", "critical"}
 
           IMPACT_COLOR = {
-              "none": "#36a64f", "minor": "#f0c418",
-              "major": "#e07b39", "critical": "#cc0000",
+              "minor":    "#f0c418",
+              "major":    "#e07b39",
+              "critical": "#cc0000",
+          }
+          IMPACT_EMOJI = {
+              "minor":    "⚠️",
+              "major":    "🔶",
+              "critical": "🔴",
           }
 
-          def now():
-              return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+          # ── Load already-alerted update IDs from cache ───────────────────
+          alerted = set()
+          if os.path.exists(CACHE_FILE):
+              with open(CACHE_FILE) as f:
+                  alerted = set(line.strip() for line in f if line.strip())
 
-          def post_slack(text, color="#f0c418", fields=None):
-              payload = {
-                  "text": text,
-                  "attachments": [{"color": color, "fields": fields or []}]
-              }
-              r = requests.post(WEBHOOK, json=payload, timeout=10)
+          new_alerts = []
+
+          # ── Fetch status summary ──────────────────────────────────────────
+          try:
+              r = requests.get(STATUS_URL, timeout=15)
               r.raise_for_status()
+              data = r.json()
+          except Exception as e:
+              print(f"ERROR fetching status: {e}")
+              sys.exit(0)  # Don't fail the action on network errors
 
-          r = requests.get(STATUS_URL, timeout=15)
-          r.raise_for_status()
-          data = r.json()
-
-          indicator   = data["status"]["indicator"]
+          indicator   = data["status"]["indicator"]   # none/minor/major/critical
           description = data["status"]["description"]
           incidents   = data.get("incidents", [])
 
-          if indicator == "none" and not incidents:
-              print(f"✅ All systems operational at {now()}")
+          if indicator == "none" or indicator not in ALERT_ON_IMPACT:
+              print(f"✅ Status: {description} (indicator={indicator}) — no alert needed.")
               sys.exit(0)
 
-          # Build Slack message
-          incident_lines = []
+          # ── Process each incident ─────────────────────────────────────────
           for inc in incidents:
-              impact  = inc.get("impact", "?")
-              name    = inc.get("name", "Unknown")
-              status  = inc.get("status", "")
-              updates = inc.get("incident_updates", [])
-              latest  = updates[0]["body"] if updates else "No details."
+              impact  = inc.get("impact", "none")
+              if impact not in ALERT_ON_IMPACT:
+                  continue
+
+              inc_id  = inc.get("id", "")
+              name    = inc.get("name", "Unknown incident")
               link    = inc.get("shortlink", "https://status.claude.com")
-              incident_lines.append(f"• *{name}* [{impact.upper()}] — {status}\n  {latest}\n  <{link}|View →>")
+              updates = inc.get("incident_updates", [])
 
-          body = "\n\n".join(incident_lines) if incident_lines else description
+              if not updates:
+                  continue
 
-          post_slack(
-              text=f"🚨 *Claude Status Alert* — `{description}`",
-              color=IMPACT_COLOR.get(indicator, "#f0c418"),
-              fields=[
-                  {"title": "Overall",    "value": description,   "short": True},
-                  {"title": "Detected",   "value": now(),         "short": True},
-                  {"title": "Incidents",  "value": body,          "short": False},
-                  {"title": "Status Page","value": "<https://status.claude.com|status.claude.com>", "short": True},
-              ]
-          )
-          print(f"Alert sent: {indicator} — {description}")
+              # Get the latest update
+              latest_update = updates[0]
+              update_id     = latest_update.get("id", inc_id)
+              update_body   = latest_update.get("body", "No details available.")
+              update_status = latest_update.get("status", "").title()
+
+              # Use Anthropic's real timestamp, not our detection time
+              raw_ts = latest_update.get("updated_at", "")
+              try:
+                  dt = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+                  timestamp = dt.strftime("%b %d, %Y at %H:%M UTC")
+              except Exception:
+                  timestamp = raw_ts or "Unknown"
+
+              # Skip if we've already alerted on this exact update
+              if update_id in alerted:
+                  print(f"Skipping already-alerted update: {update_id} ({name})")
+                  continue
+
+              # Queue this alert
+              new_alerts.append({
+                  "update_id": update_id,
+                  "impact":    impact,
+                  "name":      name,
+                  "status":    update_status,
+                  "body":      update_body,
+                  "timestamp": timestamp,
+                  "link":      link,
+              })
+
+          # ── Send Slack alerts ─────────────────────────────────────────────
+          for alert in new_alerts:
+              emoji = IMPACT_EMOJI.get(alert["impact"], "⚠️")
+              color = IMPACT_COLOR.get(alert["impact"], "#f0c418")
+
+              payload = {
+                  "text": f"{emoji} *Claude Incident [{alert['impact'].upper()}]: {alert['name']}*",
+                  "attachments": [{
+                      "color": color,
+                      "fields": [
+                          {"title": "Status",     "value": alert["status"],           "short": True},
+                          {"title": "Impact",     "value": alert["impact"].upper(),   "short": True},
+                          {"title": "Update",     "value": alert["body"],             "short": False},
+                          {"title": "Timestamp",  "value": alert["timestamp"],        "short": True},
+                          {"title": "Status Page","value": f"<{alert['link']}|View Incident>", "short": True},
+                      ]
+                  }]
+              }
+
+              try:
+                  r = requests.post(WEBHOOK, json=payload, timeout=10)
+                  r.raise_for_status()
+                  print(f"Alert sent: [{alert['impact'].upper()}] {alert['name']}")
+                  alerted.add(alert["update_id"])
+              except Exception as e:
+                  print(f"ERROR sending Slack alert: {e}")
+
+          # ── Save updated alert history to cache ───────────────────────────
+          with open(CACHE_FILE, "w") as f:
+              f.write("\n".join(alerted))
+
+          if not new_alerts:
+              print("No new alerts to send.")
+
           EOF
+
+      - name: Save alert history cache
+        if: always()
+        uses: actions/cache@v3
+        with:
+          path: alerted_ids.txt
+          key: claude-alerted-ids-${{ github.run_id }}
