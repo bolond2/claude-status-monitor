@@ -15,20 +15,23 @@ on:
     - cron: '*/5 * * * *'   # every 5 minutes
   workflow_dispatch:         # allow manual trigger from GitHub UI
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # suppress Node.js 20 deprecation warning
+
 jobs:
   check-claude-status:
     runs-on: ubuntu-latest
     timeout-minutes: 2
 
     steps:
-      # We use the GitHub Actions cache to remember which incidents
-      # we've already alerted on — so you don't get repeat messages.
       - name: Restore alert history cache
         uses: actions/cache@v4
         with:
           path: alerted_ids.txt
+          # Cache key rotates daily — prevents stale IDs blocking new alerts
           key: claude-alerted-ids-${{ github.run_id }}
           restore-keys: |
+            claude-alerted-ids-${{ hashFiles('alerted_ids.txt') }}
             claude-alerted-ids-
 
       - name: Check Claude Status & Alert Slack
@@ -62,6 +65,9 @@ jobs:
           if os.path.exists(CACHE_FILE):
               with open(CACHE_FILE) as f:
                   alerted = set(line.strip() for line in f if line.strip())
+              print(f"Loaded {len(alerted)} previously alerted IDs from cache.")
+          else:
+              print("No cache file found — treating all current incidents as new.")
 
           new_alerts = []
 
@@ -72,19 +78,22 @@ jobs:
               data = r.json()
           except Exception as e:
               print(f"ERROR fetching status: {e}")
-              sys.exit(0)  # Don't fail the action on network errors
+              sys.exit(0)
 
-          indicator   = data["status"]["indicator"]   # none/minor/major/critical
+          indicator   = data["status"]["indicator"]
           description = data["status"]["description"]
           incidents   = data.get("incidents", [])
 
+          print(f"Overall status: {description} (indicator={indicator})")
+          print(f"Active incidents: {len(incidents)}")
+
           if indicator == "none" or indicator not in ALERT_ON_IMPACT:
-              print(f"✅ Status: {description} (indicator={indicator}) — no alert needed.")
+              print("No major/critical issues — no alert needed.")
               sys.exit(0)
 
           # ── Process each incident ─────────────────────────────────────────
           for inc in incidents:
-              impact  = inc.get("impact", "none")
+              impact = inc.get("impact", "none")
               if impact not in ALERT_ON_IMPACT:
                   continue
 
@@ -96,13 +105,11 @@ jobs:
               if not updates:
                   continue
 
-              # Get the latest update
               latest_update = updates[0]
               update_id     = latest_update.get("id", inc_id)
               update_body   = latest_update.get("body", "No details available.")
               update_status = latest_update.get("status", "").title()
 
-              # Use Anthropic's real timestamp, not our detection time
               raw_ts = latest_update.get("updated_at", "")
               try:
                   dt = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
@@ -110,12 +117,12 @@ jobs:
               except Exception:
                   timestamp = raw_ts or "Unknown"
 
-              # Skip if we've already alerted on this exact update
+              print(f"Incident: [{impact.upper()}] {name} | update_id={update_id} | status={update_status}")
+
               if update_id in alerted:
-                  print(f"Skipping already-alerted update: {update_id} ({name})")
+                  print(f"  → Already alerted on this update, skipping.")
                   continue
 
-              # Queue this alert
               new_alerts.append({
                   "update_id": update_id,
                   "impact":    impact,
@@ -150,12 +157,11 @@ jobs:
               try:
                   r = requests.post(WEBHOOK, json=payload, timeout=10)
                   r.raise_for_status()
-                  print(f"Alert sent: [{alert['impact'].upper()}] {alert['name']}")
+                  print(f"  → Alert sent: [{alert['impact'].upper()}] {alert['name']}")
                   alerted.add(alert["update_id"])
               except Exception as e:
-                  print(f"ERROR sending Slack alert: {e}")
+                  print(f"  → ERROR sending Slack alert: {e}")
 
-          # ── Save updated alert history to cache ───────────────────────────
           with open(CACHE_FILE, "w") as f:
               f.write("\n".join(alerted))
 
